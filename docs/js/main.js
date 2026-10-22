@@ -175,11 +175,12 @@ async function recolor(bitmap) {
   const sampleBuf = buffer(SAMPLE * STRIDE * 4, S.STORAGE | S.COPY_SRC);
   run("gather", bind("gather", [featBuf, idxBuf, sampleBuf, paramBuf]), Math.ceil(SAMPLE / WG));
   const sample = await read(sampleBuf, SAMPLE * STRIDE * 4, Float32Array);
+  // always cluster into 40, then merge down (below): auto stops at the min difference, a manual count stops at that
+  // count, so a manual count gives the same colors auto would at that count
   const auto = $("clusters-auto").checked;
-  if (auto) {  // auto: cluster into 40, then merge similar colors after the clustering (below)
-    K = 40;
-    writeParams(dark, light);
-  }
+  const target = auto ? 2 : K;
+  K = Math.max(40, K);
+  writeParams(dark, light);
   const centerBuf = buffer(K * STRIDE * 4, S.STORAGE | S.COPY_DST);
   const sumBuf = buffer(K * chunks * STRIDE * 4, S.STORAGE | S.COPY_SRC);
   const medBuf = buffer(K * chunks * 8, S.STORAGE | S.COPY_SRC);
@@ -227,26 +228,26 @@ async function recolor(bitmap) {
     medoids.push(bestI);
   }
 
-  // auto: merge the two most similar clusters (by their medoid colors in Lab) until the closest pair is at least the
-  // min difference apart; clusters under 0.1% of the pixels are folded into their nearest first, so specks don't survive.
-  // groupOf maps each cluster to the cluster whose color it now shows (the bigger one in each merge)
+  // merge the two most similar clusters (by their medoid colors in Lab) until the target count, or for auto until the
+  // closest pair is at least the min difference apart; clusters under 0.1% of the pixels are folded into their nearest
+  // first, so specks don't survive. groupOf maps each cluster to the cluster whose color it now shows (the bigger one)
   let groupOf = medoids.map((_, c) => c);
-  if (auto) {
+  {
     const labOf = medoids.map((i) => (i < 0 ? null : toLab(pixels[i])));
     const alive = new Set(medoids.flatMap((i, c) => (i < 0 ? [] : [c])));
     const size = Array.from(clusterSizes);
     const de = (a, b) => Math.hypot(labOf[a][0] - labOf[b][0], labOf[a][1] - labOf[b][1], labOf[a][2] - labOf[b][2]);
     const merge = (from, into) => { size[into] += size[from]; alive.delete(from); groupOf = groupOf.map((g) => (g === from ? into : g)); };
     const nearest = (c) => [...alive].filter((d) => d !== c).reduce((best, d) => (best < 0 || de(c, d) < de(c, best) ? d : best), -1);
-    for (const c of [...alive]) if (alive.size > 2 && size[c] < 0.001 * n) merge(c, nearest(c));  // never below 2 colors
+    for (const c of [...alive]) if (alive.size > target && size[c] < 0.001 * n) merge(c, nearest(c));  // never below the target
     const minDiff = Number($("min-diff").value);
-    while (alive.size > 2) {
+    while (alive.size > target) {
       let best = Infinity, pa = -1, pb = -1;
       for (const a of alive) for (const b of alive) if (a < b && de(a, b) < best) { best = de(a, b); pa = a; pb = b; }
-      if (best >= minDiff) break;
+      if (auto && best >= minDiff) break;
       if (size[pa] >= size[pb]) merge(pb, pa); else merge(pa, pb);
     }
-    $("clusters").value = alive.size;
+    if (auto) $("clusters").value = alive.size;
   }
   const shown = [...new Set(groupOf)];
 
