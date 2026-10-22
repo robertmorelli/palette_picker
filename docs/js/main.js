@@ -9,7 +9,12 @@ const WEIGHTS = [["LCh L", 0], ["LCh C", 0], ["LCh h", 0], ["Brownness", 0], ["W
   ["Lab L", 1], ["Lab a", 1], ["Lab b", 1], ["Hilbert", 0], ["Z-order", 0], ["Peano", 0]];
 
 const $ = (id) => document.getElementById(id);
-const status = (text) => ($("status").textContent = text);
+// status text, plus a small square that fills bottom to top with progress (0-1); no progress hides it in place
+const status = (text, p) => {
+  $("status").textContent = text;
+  $("progress").style.visibility = p === undefined ? "hidden" : "";
+  $("progress").style.setProperty("--p", p ?? 0);
+};
 
 
 let device, pipelines;
@@ -154,7 +159,7 @@ async function recolor(bitmap) {
   const [gx, gy] = pixelGroups(n);
 
   // 1. relative lightness range: the 5th and 95th percentiles of L
-  status("Measuring lightness…");
+  status("Measuring lightness…", 0.05);
   writeParams(0, 100);
   const sharpBuf = buffer(n * 4, S.STORAGE);
   run("sharpen", bind("sharpen", [pxBuf, sharpBuf, paramBuf]), gx, gy);
@@ -166,7 +171,7 @@ async function recolor(bitmap) {
   writeParams(dark, light);
 
   // 2. clustering values, and k-means++ starting points from a sample
-  status("Computing features…");
+  status("Computing features…", 0.1);
   run("features", bind("features", [sharpBuf, featBuf, paramBuf]), gx, gy);
   const random = rng(0);
   const idx = Uint32Array.from({ length: SAMPLE }, () => Math.floor(random() * n));
@@ -194,7 +199,7 @@ async function recolor(bitmap) {
   // they settle onto real colors, so the posterized image, sizes and medoids don't pick up sharpening halos at edges
   const SETTLE = 5;
   for (let it = 0; it < ITERS + SETTLE; it++) {
-    status(`k-means ${it + 1}/${ITERS + SETTLE}…`);
+    status(`k-means ${it + 1}/${ITERS + SETTLE}…`, 0.1 + (0.8 * (it + 1)) / (ITERS + SETTLE));
     if (it === ITERS) run("features", bind("features", [pxBuf, featBuf, paramBuf]), gx, gy);
     device.queue.writeBuffer(centerBuf, 0, centers);
     run("assign", assignGroup, gx, gy);
@@ -214,7 +219,7 @@ async function recolor(bitmap) {
   run("assign", assignGroup, gx, gy);
 
   // 4. medoids: the real pixel closest to each cluster's center
-  status("Finding medoids…");
+  status("Finding medoids…", 0.92);
   run("medoid", bind("medoid", [labelBuf, distBuf, medBuf, paramBuf]), chunks, K);
   const medPartial = await read(medBuf, K * chunks * 8, Uint32Array);
   const medPartialF = new Float32Array(medPartial.buffer);
@@ -280,7 +285,7 @@ async function recolor(bitmap) {
   }
 
   // 5. paint every pixel its medoid's color, and a debug version with one random color per cluster
-  status("Rendering…");
+  status("Rendering…", 0.96);
   const paletteBuf = buffer(K * 4, S.STORAGE | S.COPY_DST);
   const outBuf = buffer(n * 4, S.STORAGE | S.COPY_SRC);
   const renderGroup = bind("render", [labelBuf, paletteBuf, outBuf, paramBuf]);
@@ -536,7 +541,7 @@ $("clusters-auto").addEventListener("change", rerun);
 async function handle(source) {
   try {
     if (!device) await initGPU();
-    status("Loading image…");
+    status("Loading image…", 0);
     lastBitmap = await createImageBitmap(source);
   } catch (err) {
     console.error(err);
