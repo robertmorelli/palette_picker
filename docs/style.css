@@ -1,0 +1,61 @@
+/* layout: a slim toolbar over the posterized image, with the 16 medoid swatches in a column to its right, joined by leader lines */
+:root {
+  --bg: #eef0f2; --panel: #ffffff; --fg: #17191c; --muted: #5d636b; --rule: #d3d7dd; --accent: #2f5fd0;
+  --sans: system-ui, -apple-system, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #121417; --panel: #1b1e22; --fg: #e8eaee; --muted: #9aa1aa; --rule: #2c3036; --accent: #7fa2f2; color-scheme: dark; }
+}
+:root[data-theme="dark"] { --bg: #121417; --panel: #1b1e22; --fg: #e8eaee; --muted: #9aa1aa; --rule: #2c3036; --accent: #7fa2f2; color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+.wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header { display: flex; gap: 12px 16px; align-items: center; flex-wrap: wrap; padding-block: 12px; border-bottom: 1px solid var(--rule); background: var(--panel); }
+header h1 { font: 600 15px/1 var(--mono); letter-spacing: 0.02em; margin: 0; }
+button { font: 13px/1 var(--sans); padding: 8px 14px; border: 0; border-radius: 0; background: var(--rule); color: var(--fg); cursor: pointer; }
+button:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; }
+button[aria-pressed="true"] { background: var(--fg); color: var(--panel); }
+button:disabled { opacity: 0.5; cursor: default; }
+#status { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
+header { position: relative; z-index: 2; }
+#tuning {
+  position: absolute; top: 8px; left: max(16px, env(safe-area-inset-left, 0px)); z-index: 3;
+  display: grid; grid-template-columns: auto minmax(120px, 200px) auto; gap: 8px 12px; align-items: center;
+  padding: 12px 14px; background: var(--panel); border: 1px solid var(--fg); border-radius: 0;
+}
+#tuning h2 { grid-column: 1 / -1; margin: 0 0 2px; font: 600 11px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+#tuning label { font: 500 13px/1 var(--sans); }
+#tuning input { width: 100%; accent-color: var(--accent); }
+#tuning .auto { display: flex; align-items: center; gap: 4px; font: 13px/1 var(--sans); white-space: nowrap; }
+#tuning .auto input { width: auto; margin: 0; }
+#tuning output { font: 500 13px/1 var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+#tuning input[type="number"] { width: 72px; font: 13px/1 var(--mono); padding: 6px 8px; border-radius: 0; border: 1px solid var(--fg); background: var(--panel); color: var(--fg); font-variant-numeric: tabular-nums; }
+#tuning h2 + label, #tuning span + h2 { margin-top: 4px; }
+#sample { font: 600 11px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border: 1px solid var(--rule); border-radius: 0; padding: 4px 6px; }
+main { position: relative; display: flex; gap: 96px; align-items: flex-start; padding-block: 16px; }
+main.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
+#imageBox { flex: 1 1 auto; min-width: 0; display: flex; justify-content: center; }
+#result { display: block; max-width: 100%; max-height: calc(100vh - 100px); background: var(--panel); }
+#chips { flex: 0 0 112px; display: flex; flex-direction: column; gap: 6px; }  /* fixed width, so the image never shifts as swatches come and go */
+.chip {
+  --chip: #888; background: var(--chip); color: var(--chip-text, #000);
+  font: 600 13px/1 var(--mono); letter-spacing: 0.03em; padding: 7px 12px; border-radius: 0; min-width: 100px; text-align: center;
+}
+@supports (color: contrast-color(red)) { .chip { color: contrast-color(var(--chip)); } }
+#groups { display: flex; flex-direction: column; gap: 8px; padding-block: 0 16px; }
+#groups-out { display: flex; flex-direction: column; gap: 8px; }
+#groups-left { flex: 0 0 112px; display: flex; flex-direction: column; gap: 6px; }  /* fixed width, like the hex column */
+.group { display: flex; width: 100%; }
+.pca { flex: 1 1 auto; min-width: 0; }  /* the group's top principal component, as a gradient under its row */  /* the group's medoid, after its gradient */
+#groups h2 { margin: 0; font: 600 11px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.gradient { display: flex; flex-wrap: wrap; }
+.gradient .chip { flex: 1 1 0; min-width: 84px; }
+#lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+@media (max-width: 720px) {
+  main { flex-direction: column; gap: 16px; }
+  #chips { flex-basis: auto; flex-direction: row; flex-wrap: wrap; }
+  .chip { min-width: 0; }
+  #lines { display: none; }
+}
