@@ -21,12 +21,12 @@
 <main id="main" class="wrap">
   <div id="tuning" hidden>
     <h2>Clusters</h2>
-    <label for="clusters">Colors</label><input id="clusters" type="number" min="2" max="64" step="1" value="5"><label class="auto"><input type="checkbox" id="clusters-auto" checked> Auto</label>
+    <label for="clusters">Colors</label><input id="clusters" type="number" min="2" max="64" step="1" value="5"><label class="toggle"><input type="checkbox" id="clusters-auto" checked>Auto</label>
     <label for="min-diff">Min difference</label><input id="min-diff" type="range" min="2" max="40" step="1" value="20"><output id="min-diff-out" for="min-diff">20</output>
-    <label for="group-count">Groups</label><input id="group-count" type="number" min="1" max="16" step="1" value="2"><label class="auto"><input type="checkbox" id="groups-auto" checked> Auto</label>
+    <label for="group-count">Groups</label><input id="group-count" type="number" min="1" max="16" step="1" value="2"><label class="toggle"><input type="checkbox" id="groups-auto" checked>Auto</label>
     <label for="group-spread">Group spread</label><input id="group-spread" type="range" min="5" max="180" step="1" value="40"><output id="group-spread-out" for="group-spread">40</output>
     <button id="group-colors" type="button" aria-pressed="false" style="grid-column: 1 / -1">Group colors</button>
-    <label for="perceived">Perceived color</label><input type="checkbox" id="perceived" style="width: auto; justify-self: start"><span></span>
+    <label class="toggle" style="grid-column: 1 / -1"><input type="checkbox" id="perceived">Perceived color</label>
     <h2>Weights</h2>
   </div>
   <div id="imageBox"><canvas id="result" aria-label="Posterized image"></canvas></div>

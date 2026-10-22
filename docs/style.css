@@ -28,8 +28,11 @@ header { position: relative; z-index: 2; }
 #tuning h2 { grid-column: 1 / -1; margin: 0 0 2px; font: 600 11px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 #tuning label { font: 500 13px/1 var(--sans); }
 #tuning input { width: 100%; accent-color: var(--accent); }
-#tuning .auto { display: flex; align-items: center; gap: 4px; font: 13px/1 var(--sans); white-space: nowrap; }
-#tuning .auto input { width: auto; margin: 0; }
+/* checkbox toggles drawn as the same flat buttons: the box is hidden and the label shows its state */
+.toggle { font: 13px/1 var(--sans); padding: 8px 14px; background: var(--rule); color: var(--fg); cursor: pointer; text-align: center; white-space: nowrap; user-select: none; }
+.toggle:has(input:checked) { background: var(--fg); color: var(--panel); }
+.toggle:has(input:focus-visible) { outline: 2px solid var(--fg); outline-offset: 1px; }
+#tuning .toggle input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; pointer-events: none; }
 #tuning output { font: 500 13px/1 var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
 #tuning input[type="number"] { width: 72px; font: 13px/1 var(--mono); padding: 6px 8px; border-radius: 0; border: 1px solid var(--fg); background: var(--panel); color: var(--fg); font-variant-numeric: tabular-nums; }
 #tuning h2 + label, #tuning span + h2 { margin-top: 4px; }
