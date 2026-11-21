@@ -126,15 +126,66 @@ fn peano(qx: u32, qy: u32, levels: u32) -> u32 {
   feats[o + 12u] = pe * w4.x; feats[o + 13u] = 0.0;
 }`,
 
-  // copy a sample of pixels' values out, for k-means++ starting points
-  gather: COMMON + /* wgsl */ `
+  // Lab of each pixel of the working image, for mean shift filtering
+  labs: COMMON + /* wgsl */ `
+struct F { w: u32, h: u32, hs: i32, hr: f32 };
+@group(0) @binding(0) var<storage, read> px: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4f>;
+@group(0) @binding(2) var<uniform> Q: F;
+@compute @workgroup_size(${WG}) fn main(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) nw: vec3u,
+                                      @builtin(local_invocation_index) li: u32) {
+  let i = flat(wid, nw, li);
+  if (i < Q.w * Q.h) { out[i] = vec4f(lab(px[i]), 0.0); }
+}`,
+
+  // Comaniciu–Meer mean shift filtering, uniform kernels: each pixel starts at its own (x, y, Lab) and repeatedly
+  // moves to the mean of the pixels within the square window of radius hs around it whose colors are within hr of its
+  // current color, until the move is small (squared, in units of hs and hr, under 0.01). writes the color it ends at
+  msfilter: COMMON + /* wgsl */ `
+struct F { w: u32, h: u32, hs: i32, hr: f32 };
+@group(0) @binding(0) var<storage, read> labs: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4f>;
+@group(0) @binding(2) var<uniform> Q: F;
+@compute @workgroup_size(${WG}) fn main(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) nw: vec3u,
+                                      @builtin(local_invocation_index) li: u32) {
+  let i = flat(wid, nw, li);
+  if (i >= Q.w * Q.h) { return; }
+  var pos = vec2f(f32(i % Q.w), f32(i / Q.w));
+  var col = labs[i].xyz;
+  let hs = f32(Q.hs); let hr2 = Q.hr * Q.hr;
+  for (var it = 0; it < 20; it++) {
+    let cx = i32(round(pos.x)); let cy = i32(round(pos.y));
+    var sp = vec2f(0.0); var sc = vec3f(0.0); var cnt = 0.0;
+    for (var yy = max(cy - Q.hs, 0); yy <= min(cy + Q.hs, i32(Q.h) - 1); yy++) {
+      for (var xx = max(cx - Q.hs, 0); xx <= min(cx + Q.hs, i32(Q.w) - 1); xx++) {
+        let c = labs[u32(yy) * Q.w + u32(xx)].xyz;
+        let d = c - col;
+        if (dot(d, d) <= hr2) { sp += vec2f(f32(xx), f32(yy)); sc += c; cnt += 1.0; }
+      }
+    }
+    if (cnt == 0.0) { break; }
+    let dp = sp / cnt - pos; let dc = sc / cnt - col;
+    pos += dp; col += dc;
+    if (dot(dp, dp) / (hs * hs) + dot(dc, dc) / hr2 < 0.01) { break; }
+  }
+  out[i] = vec4f(col, 0.0);
+}`,
+
+  // each pixel's squared distance to its own cluster's center (for medoids)
+  distance: COMMON + /* wgsl */ `
 @group(0) @binding(0) var<storage, read> feats: array<f32>;
-@group(0) @binding(1) var<storage, read> idx: array<u32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> P: Params;
-@compute @workgroup_size(${WG}) fn main(@builtin(global_invocation_id) g: vec3u) {
-  if (g.x >= P.m) { return; }
-  for (var d = 0u; d < ${STRIDE}u; d++) { out[g.x * ${STRIDE}u + d] = feats[idx[g.x] * ${STRIDE}u + d]; }
+@group(0) @binding(1) var<storage, read> centers: array<f32>;
+@group(0) @binding(2) var<storage, read> labels: array<u32>;
+@group(0) @binding(3) var<storage, read_write> dist: array<f32>;
+@group(0) @binding(4) var<uniform> P: Params;
+@compute @workgroup_size(${WG}) fn main(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) nw: vec3u,
+                                      @builtin(local_invocation_index) li: u32) {
+  let i = flat(wid, nw, li);
+  if (i >= P.n) { return; }
+  let c = labels[i];
+  var d = 0.0;
+  for (var j = 0u; j < ${FEATURES}u; j++) { let t = feats[i * ${STRIDE}u + j] - centers[c * ${STRIDE}u + j]; d += t * t; }
+  dist[i] = d;
 }`,
 
   // nearest center for each pixel, and its squared distance (for medoids)

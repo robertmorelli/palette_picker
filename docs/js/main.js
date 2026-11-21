@@ -1,9 +1,11 @@
 import { WG, CHUNK, FEATURES, STRIDE, SHADERS } from "./shaders.js";
 import { hex, toLab, SRGB_LIN, camConditions, perceive, estimateWhite, pcaGradient } from "./color.js";
-// recolor15.py on WebGPU: full-resolution k-means on (relative L x2, C, h, brownness, whiteness, x, y) with position x0.4,
-// each cluster painted its medoid (the real pixel closest to its center). the per-pixel work runs in compute shaders; the CPU
-// only handles small summaries (lightness histogram, per-chunk cluster sums) and k-means++ starting points from a sample.
-const ITERS = 25, SAMPLE = 4096;
+// palette extraction on WebGPU, after Comaniciu & Meer (2002): mean shift filtering in the joint (x, y, Lab) domain,
+// fusing the modes into regions, and one palette candidate per group of same-colored regions; each is painted its
+// medoid (the real pixel closest to its mean). the per-pixel work runs in compute shaders; the CPU fuses regions on a
+// downscaled working image and handles small summaries (lightness histogram, per-chunk cluster sums).
+// WORK: long side of the working image mean shift runs on; MAX_MODES: most palette candidates before merging
+const WORK = 1024, MAX_MODES = 128;
 // how much each clustering value counts; tunable from the Weights panel in debug mode
 const WEIGHTS = [["LCh L", 0], ["LCh C", 0], ["LCh h", 0], ["Brownness", 0], ["Whiteness", 0], ["x", 0], ["y", 0],
   ["Lab L", 1], ["Lab a", 1], ["Lab b", 1], ["Hilbert", 0], ["Z-order", 0], ["Peano", 0]];
@@ -110,21 +112,80 @@ function spreadK(sample, labs, m, radius) {
   return Math.max(2, clusters.length);
 }
 
-function kmeansPlusPlus(sample, m, k, random) {
-  const d2 = (i, c) => { let s = 0; for (let j = 0; j < FEATURES; j++) { const t = sample[i * STRIDE + j] - c[j]; s += t * t; } return s; };
-  const centers = [sample.slice(0, STRIDE)];
-  const nearest = new Float64Array(m).map((_, i) => d2(i, centers[0]));
-  while (centers.length < k) {
-    let total = 0; for (const v of nearest) total += v;
-    let r = random() * total, pick = 0;
-    while (pick < m - 1 && (r -= nearest[pick]) > 0) pick++;
-    const c = sample.slice(pick * STRIDE, pick * STRIDE + STRIDE);
-    centers.push(c);
-    for (let i = 0; i < m; i++) nearest[i] = Math.min(nearest[i], d2(i, c));
+// Comaniciu–Meer fusion, on the filtered (mode) colors of the working image, packed as L, a, b, - per pixel:
+// 1. neighboring pixels whose modes are within hr join one region
+// 2. regions under minSize pixels are folded into their closest-colored neighbor (a few rounds)
+// 3. regions anywhere in the image whose mean colors are within hr become one palette candidate, biggest regions
+//    first, at most MAX_MODES of them
+// returns the candidate of every working pixel, and how many candidates there are
+function segment(lab, ww, wh, hr, minSize) {
+  const N = ww * wh, hr2 = hr * hr;
+  const uf = (size) => {
+    const parent = Int32Array.from({ length: size }, (_, i) => i);
+    const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+    return { find, union: (a, b) => { a = find(a); b = find(b); if (a !== b) parent[b] = a; } };
+  };
+  // regions grow from a seed pixel by flood fill; a neighbor joins when its mode is within hr/2 of the region's running
+  // mean (not just of the neighbor it touches), so smooth gradients can't chain far-apart colors into one region
+  const region = new Int32Array(N).fill(-1);
+  let R = 0, size, sum;
+  {
+    const queue = new Int32Array(N), half2 = hr2 / 4;
+    for (let s = 0; s < N; s++) {
+      if (region[s] >= 0) continue;
+      let head = 0, tail = 0, count = 1, mL = lab[4 * s], mA = lab[4 * s + 1], mB = lab[4 * s + 2];
+      region[s] = R; queue[tail++] = s;
+      while (head < tail) {
+        const i = queue[head++], x = i % ww;
+        for (const j of [x > 0 ? i - 1 : -1, x + 1 < ww ? i + 1 : -1, i - ww, i + ww < N ? i + ww : -1]) {
+          if (j < 0 || region[j] >= 0) continue;
+          const L = lab[4 * j], A = lab[4 * j + 1], B = lab[4 * j + 2];
+          if ((L - mL / count) ** 2 + (A - mA / count) ** 2 + (B - mB / count) ** 2 >= half2) continue;
+          region[j] = R; queue[tail++] = j; count++; mL += L; mA += A; mB += B;
+        }
+      }
+      R++;
+    }
   }
-  const flatCenters = new Float32Array(k * STRIDE);
-  centers.forEach((c, i) => flatCenters.set(c, i * STRIDE));
-  return flatCenters;
+  const stats = () => {
+    size = new Float64Array(R); sum = new Float64Array(R * 3);
+    for (let i = 0; i < N; i++) { const r = region[i]; size[r]++; for (let j = 0; j < 3; j++) sum[3 * r + j] += lab[4 * i + j]; }
+  };
+  const dist2 = (a, b) => { let s = 0; for (let j = 0; j < 3; j++) s += (sum[3 * a + j] / size[a] - sum[3 * b + j] / size[b]) ** 2; return s; };
+  stats();
+  for (let round = 0; round < 4; round++) {
+    const best = new Int32Array(R).fill(-1), bestD = new Float64Array(R).fill(Infinity);
+    const consider = (a, b) => { if (a === b || size[a] >= minSize) return; const d = dist2(a, b); if (d < bestD[a]) { bestD[a] = d; best[a] = b; } };
+    for (let y = 0; y < wh; y++) for (let x = 0; x < ww; x++) {
+      const i = y * ww + x;
+      if (x + 1 < ww) { consider(region[i], region[i + 1]); consider(region[i + 1], region[i]); }
+      if (y + 1 < wh) { consider(region[i], region[i + ww]); consider(region[i + ww], region[i]); }
+    }
+    if (best.every((b) => b < 0)) break;
+    const rg = uf(R);
+    for (let a = 0; a < R; a++) if (best[a] >= 0) rg.union(best[a], a);
+    const id = new Int32Array(R).fill(-1);
+    let next = 0;
+    for (let a = 0; a < R; a++) { const r = rg.find(a); if (id[r] < 0) id[r] = next++; }
+    for (let i = 0; i < N; i++) region[i] = id[rg.find(region[i])];
+    R = next;
+    stats();
+  }
+  // palette candidates: biggest regions first; each joins the closest candidate within hr, or starts a new one
+  const order = Array.from({ length: R }, (_, r) => r).sort((a, b) => size[b] - size[a]);
+  const cand = new Int32Array(R), cSize = [], cSum = [];
+  for (const r of order) {
+    const m = [0, 1, 2].map((j) => sum[3 * r + j] / size[r]);
+    let bestC = -1, bestD = Infinity;
+    for (let c = 0; c < cSize.length; c++) {
+      const d = [0, 1, 2].reduce((s, j) => s + (cSum[c][j] / cSize[c] - m[j]) ** 2, 0);
+      if (d < bestD) { bestD = d; bestC = c; }
+    }
+    if (bestC < 0 || (bestD >= hr2 && cSize.length < MAX_MODES)) { bestC = cSize.length; cSize.push(0); cSum.push([0, 0, 0]); }
+    cand[r] = bestC; cSize[bestC] += size[r];
+    for (let j = 0; j < 3; j++) cSum[bestC][j] += sum[3 * r + j];
+  }
+  return { labels: Int32Array.from(region, (r) => cand[r]), count: cSize.length, regions: R };
 }
 
 async function recolor(bitmap) {
@@ -146,15 +207,16 @@ async function recolor(bitmap) {
   const params = new ArrayBuffer(112), pu = new Uint32Array(params), pf = new Float32Array(params);
   // space-filling curve grids: the smallest 2^n (hilbert, z-order) and 3^levels (peano) squares that cover the image
   const hilbertN = 2 ** Math.ceil(Math.log2(Math.max(w, h))), peanoLevels = Math.max(1, Math.ceil(Math.log(Math.max(w, h)) / Math.log(3) - 1e-9));
-  const writeParams = (dark, light) => {
-    pu.set([n, w, h, K]); pf.set([dark, light], 4); pu.set([chunks, SAMPLE, hilbertN, peanoLevels, 0, 0], 6); pf.set(weightValues(), 12);
+  const writeParams = (dark, light, k = K) => {
+    pu.set([n, w, h, k]); pf.set([dark, light], 4); pu.set([chunks, 0, hilbertN, peanoLevels, 0, 0], 6);
+    pf.set(weightValues(), 12);
     device.queue.writeBuffer(paramBuf, 0, params);
   };
   const paramBuf = buffer(112, S.UNIFORM | S.COPY_DST);
   const pxBuf = buffer(n * 4, S.STORAGE | S.COPY_DST);
   device.queue.writeBuffer(pxBuf, 0, pixels);
   const featBuf = buffer(n * STRIDE * 4, S.STORAGE);
-  const labelBuf = buffer(n * 4, S.STORAGE | S.COPY_SRC);
+  const labelBuf = buffer(n * 4, S.STORAGE | S.COPY_SRC | S.COPY_DST);
   const distBuf = buffer(n * 4, S.STORAGE);
   const [gx, gy] = pixelGroups(n);
 
@@ -170,53 +232,71 @@ async function recolor(bitmap) {
   const dark = percentile(0.05), light = percentile(0.95);
   writeParams(dark, light);
 
-  // 2. clustering values, and k-means++ starting points from a sample
+  // 2. clustering values, from the original (unsharpened) pixels
   status("Computing features…", 0.1);
-  run("features", bind("features", [sharpBuf, featBuf, paramBuf]), gx, gy);
-  const random = rng(0);
-  const idx = Uint32Array.from({ length: SAMPLE }, () => Math.floor(random() * n));
-  const idxBuf = buffer(SAMPLE * 4, S.STORAGE | S.COPY_DST);
-  device.queue.writeBuffer(idxBuf, 0, idx);
-  const sampleBuf = buffer(SAMPLE * STRIDE * 4, S.STORAGE | S.COPY_SRC);
-  run("gather", bind("gather", [featBuf, idxBuf, sampleBuf, paramBuf]), Math.ceil(SAMPLE / WG));
-  const sample = await read(sampleBuf, SAMPLE * STRIDE * 4, Float32Array);
-  // always cluster into 40, then merge down (below): auto stops at the min difference, a manual count stops at that
-  // count, so a manual count gives the same colors auto would at that count
+  run("features", bind("features", [pxBuf, featBuf, paramBuf]), gx, gy);
+
+  // 3. Comaniciu–Meer mean shift filtering on a working copy of the image (at most WORK pixels on its long side, so the
+  // per-pixel windows stay affordable): every pixel climbs to its mode in the joint (x, y, Lab) domain, with a square
+  // spatial window of radius hs and a color radius hr in Lab
+  const scale = Math.min(1, WORK / Math.max(w, h));
+  const ww = Math.max(1, Math.round(w * scale)), wh = Math.max(1, Math.round(h * scale)), N = ww * wh;
+  const work = new OffscreenCanvas(ww, wh).getContext("2d");
+  work.imageSmoothingQuality = "high";
+  work.drawImage(bitmap, 0, 0, ww, wh);
+  const workPx = new Uint32Array(work.getImageData(0, 0, ww, wh).data.buffer);
+  const hs = Math.round(Number($("spatial-radius").value)), hr = Number($("color-radius").value);
+  const fParams = new ArrayBuffer(16);
+  new Uint32Array(fParams).set([ww, wh]); new Int32Array(fParams)[2] = hs; new Float32Array(fParams)[3] = hr;
+  const fBuf = buffer(16, S.UNIFORM | S.COPY_DST);
+  device.queue.writeBuffer(fBuf, 0, fParams);
+  const workBuf = buffer(N * 4, S.STORAGE | S.COPY_DST);
+  device.queue.writeBuffer(workBuf, 0, workPx);
+  const workLabBuf = buffer(N * 16, S.STORAGE);
+  const filteredBuf = buffer(N * 16, S.STORAGE | S.COPY_SRC);
+  const [fx, fy] = pixelGroups(N);
+  status("Mean shift filtering…", 0.2);
+  run("labs", bind("labs", [workBuf, workLabBuf, fBuf]), fx, fy);
+  run("msfilter", bind("msfilter", [workLabBuf, filteredBuf, fBuf]), fx, fy);
+  const filtered = await read(filteredBuf, N * 16, Float32Array);
+
+  // 4. fuse the modes into regions, and the regions into palette candidates (on the CPU; the working image is small)
+  status("Fusing regions…", 0.6);
+  const seg = segment(filtered, ww, wh, hr, Math.max(20, 0.0002 * N));
+
+  // every full-size pixel takes the candidate of the working pixel it falls in
+  const colOf = Int32Array.from({ length: w }, (_, x) => Math.min(ww - 1, Math.floor((x * ww) / w)));
+  const labels = new Uint32Array(n);
+  for (let y = 0; y < h; y++) {
+    const row = Math.min(wh - 1, Math.floor((y * wh) / h)) * ww, o = y * w;
+    for (let x = 0; x < w; x++) labels[o + x] = seg.labels[row + colOf[x]];
+  }
+
+  // then merge the candidates down (below): auto stops at the min difference, a manual count stops at that count
   const auto = $("clusters-auto").checked;
   const target = auto ? 2 : K;
-  K = Math.max(40, K);
+  K = seg.count;
   writeParams(dark, light);
   const centerBuf = buffer(K * STRIDE * 4, S.STORAGE | S.COPY_DST);
   const sumBuf = buffer(K * chunks * STRIDE * 4, S.STORAGE | S.COPY_SRC);
   const medBuf = buffer(K * chunks * 8, S.STORAGE | S.COPY_SRC);
-  let centers = kmeansPlusPlus(sample, SAMPLE, K, random);
 
-  // 3. k-means: assign on the GPU, sum per (cluster, chunk) on the GPU, add up the small partials here
-  const assignGroup = bind("assign", [featBuf, centerBuf, labelBuf, distBuf, paramBuf]);
-  const sumGroup = bind("sums", [featBuf, labelBuf, sumBuf, paramBuf]);
-  const clusterSizes = new Float64Array(K);  // pixels per cluster, from the last k-means pass
-  // the last few iterations run on the original (unsharpened) pixels: sharpening steers where the centers start, then
-  // they settle onto real colors, so the posterized image, sizes and medoids don't pick up sharpening halos at edges
-  const SETTLE = 5;
-  for (let it = 0; it < ITERS + SETTLE; it++) {
-    status(`k-means ${it + 1}/${ITERS + SETTLE}…`, 0.1 + (0.8 * (it + 1)) / (ITERS + SETTLE));
-    if (it === ITERS) run("features", bind("features", [pxBuf, featBuf, paramBuf]), gx, gy);
-    device.queue.writeBuffer(centerBuf, 0, centers);
-    run("assign", assignGroup, gx, gy);
-    run("sums", sumGroup, chunks, K);
-    const partial = await read(sumBuf, K * chunks * STRIDE * 4, Float32Array);
-    const next = new Float32Array(centers);
-    for (let c = 0; c < K; c++) {
-      const total = new Float64Array(STRIDE);
-      for (let ch = 0; ch < chunks; ch++) for (let j = 0; j < STRIDE; j++) total[j] += partial[(c * chunks + ch) * STRIDE + j];
-      const count = total[STRIDE - 1];
-      clusterSizes[c] = count;
-      if (count > 0) for (let j = 0; j < FEATURES; j++) next[c * STRIDE + j] = total[j] / count;  // empty: keep old center
-    }
-    centers = next;
+  // each candidate's center is the mean clustering values of its pixels (summed per (cluster, chunk) on the GPU), and
+  // each pixel's distance to its own center picks the medoids
+  status("Measuring regions…", 0.85);
+  device.queue.writeBuffer(labelBuf, 0, labels);
+  run("sums", bind("sums", [featBuf, labelBuf, sumBuf, paramBuf]), chunks, K);
+  const partial = await read(sumBuf, K * chunks * STRIDE * 4, Float32Array);
+  const clusterSizes = new Float64Array(K);  // pixels per cluster
+  const centers = new Float32Array(K * STRIDE);
+  for (let c = 0; c < K; c++) {
+    const total = new Float64Array(STRIDE);
+    for (let ch = 0; ch < chunks; ch++) for (let j = 0; j < STRIDE; j++) total[j] += partial[(c * chunks + ch) * STRIDE + j];
+    clusterSizes[c] = total[STRIDE - 1];
+    if (total[STRIDE - 1] > 0) for (let j = 0; j < FEATURES; j++) centers[c * STRIDE + j] = total[j] / total[STRIDE - 1];
   }
   device.queue.writeBuffer(centerBuf, 0, centers);
-  run("assign", assignGroup, gx, gy);
+  run("distance", bind("distance", [featBuf, centerBuf, labelBuf, distBuf, paramBuf]), gx, gy);
 
   // 4. medoids: the real pixel closest to each cluster's center
   status("Finding medoids…", 0.92);
@@ -234,8 +314,9 @@ async function recolor(bitmap) {
   }
 
   // merge the two most similar clusters (by their medoid colors in Lab) until the target count, or for auto until the
-  // closest pair is at least the min difference apart; clusters under 0.1% of the pixels are folded into their nearest
-  // first, so specks don't survive. groupOf maps each cluster to the cluster whose color it now shows (the bigger one)
+  // closest pair is at least the min difference apart; clusters under 0.02% of the pixels (the same floor as the
+  // regions, so small but coherent accents survive) are folded into their nearest first, so specks don't. groupOf maps
+  // each cluster to the cluster whose color it now shows (the bigger one)
   let groupOf = medoids.map((_, c) => c);
   {
     const labOf = medoids.map((i) => (i < 0 ? null : toLab(pixels[i])));
@@ -244,7 +325,7 @@ async function recolor(bitmap) {
     const de = (a, b) => Math.hypot(labOf[a][0] - labOf[b][0], labOf[a][1] - labOf[b][1], labOf[a][2] - labOf[b][2]);
     const merge = (from, into) => { size[into] += size[from]; alive.delete(from); groupOf = groupOf.map((g) => (g === from ? into : g)); };
     const nearest = (c) => [...alive].filter((d) => d !== c).reduce((best, d) => (best < 0 || de(c, d) < de(c, best) ? d : best), -1);
-    for (const c of [...alive]) if (alive.size > target && size[c] < 0.001 * n) merge(c, nearest(c));  // never below the target
+    for (const c of [...alive]) if (alive.size > target && size[c] < 0.0002 * n) merge(c, nearest(c));  // never below the target
     const minDiff = Number($("min-diff").value);
     while (alive.size > target) {
       let best = Infinity, pa = -1, pb = -1;
@@ -306,9 +387,9 @@ async function recolor(bitmap) {
   showView();
   $("debug").disabled = $("posterize").disabled = false;
 
-  for (const b of [paramBuf, pxBuf, sharpBuf, featBuf, labelBuf, distBuf, centerBuf, sumBuf, medBuf, histBuf, idxBuf, sampleBuf, paletteBuf, outBuf]) b.destroy();
+  for (const b of [paramBuf, pxBuf, sharpBuf, featBuf, labelBuf, distBuf, centerBuf, sumBuf, medBuf, histBuf, workBuf, workLabBuf, filteredBuf, fBuf, paletteBuf, outBuf]) b.destroy();
   showChips(shown.filter((g) => medoids[g] >= 0).map((g) => ({ x: medoids[g] % w, y: Math.floor(medoids[g] / w), rgba: display[g] })), w, h);
-  status(`${w}×${h} · ${shown.length} colors · ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+  status(`${w}×${h} · ${seg.regions} regions · ${shown.length} colors ·${((performance.now() - t0) / 1000).toFixed(2)}s`);
 }
 
 // one slider per clustering weight; the image updates as the slider moves
@@ -329,6 +410,8 @@ reset.addEventListener("click", () => {
   $("clusters-auto").checked = $("groups-auto").checked = true;
   $("perceived").checked = false;
   $("min-diff").value = $("min-diff-out").textContent = 20;
+  $("spatial-radius").value = $("spatial-radius-out").textContent = 7;
+  $("color-radius").value = $("color-radius-out").textContent = 8;
   $("group-spread").value = $("group-spread-out").textContent = 40;
   for (const [name, value] of WEIGHTS) {
     const input = $(`weight-${name}`);
@@ -493,8 +576,9 @@ function renderGroups(colors = lastColors) {
 }
 $("group-count").addEventListener("input", () => { $("groups-auto").checked = false; renderGroups(); });
 $("groups-auto").addEventListener("change", () => renderGroups());
-for (const id of ["min-diff", "group-spread"]) $(id).addEventListener("input", () => ($(`${id}-out`).textContent = $(id).value));
+for (const id of ["min-diff", "spatial-radius", "color-radius", "group-spread"]) $(id).addEventListener("input", () => ($(`${id}-out`).textContent = $(id).value));
 $("min-diff").addEventListener("input", () => { if ($("clusters-auto").checked) rerun(); });
+for (const id of ["spatial-radius", "color-radius"]) $(id).addEventListener("input", rerun);
 $("group-spread").addEventListener("input", () => { if ($("groups-auto").checked) renderGroups(); });
 
 function drawLines() {
